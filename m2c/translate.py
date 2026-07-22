@@ -3714,6 +3714,24 @@ class NodeState:
 
         return expr
 
+    def _force_pending_args(self, expr_filter: Callable[[Expression], bool]) -> None:
+        for loc, pending in self.subroutine_args.items():
+            if not uses_expr(pending.value, expr_filter):
+                continue
+            pending_expr: Expression = pending.value
+            while isinstance(pending_expr, Cast):
+                pending_expr = pending_expr.expr
+            if not isinstance(pending_expr, EvalOnceExpr):
+                pending_expr = self._eval_once(
+                    pending.value,
+                    emit_exactly_once=False,
+                    transparent=should_wrap_transparently(pending.value),
+                    reg=Register.fictive("call_arg", str(loc)),
+                    source=self.regs.current_instr_ref(),
+                )
+                pending.value = pending_expr
+            pending.force = True
+
     def _prevent_later_uses(self, expr_filter: Callable[[Expression], bool]) -> None:
         """Prevent later uses of registers that recursively contain something that
         matches a callback filter."""
@@ -3738,22 +3756,7 @@ class NodeState:
         # Pending call arguments are expressions too. In particular, an x86
         # push may capture a call result here before an intervening store;
         # force its once-variable so the call cannot move past that store.
-        for loc, pending in self.subroutine_args.items():
-            if not uses_expr(pending.value, expr_filter):
-                continue
-            pending_expr: Expression = pending.value
-            while isinstance(pending_expr, Cast):
-                pending_expr = pending_expr.expr
-            if not isinstance(pending_expr, EvalOnceExpr):
-                pending_expr = self._eval_once(
-                    pending.value,
-                    emit_exactly_once=False,
-                    transparent=should_wrap_transparently(pending.value),
-                    reg=Register.fictive("call_arg", str(loc)),
-                    source=self.regs.current_instr_ref(),
-                )
-                pending.value = pending_expr
-            pending.force = True
+        self._force_pending_args(expr_filter)
 
     def prevent_later_value_uses(self, sub_expr: Expression) -> None:
         """Prevent later uses of registers that recursively contain a given
@@ -3774,24 +3777,7 @@ class NodeState:
 
     def defer_pending_reads(self) -> None:
         """Capture pending memory arguments lazily if their later call is consumed."""
-        for loc, pending in self.subroutine_args.items():
-            if not uses_expr(
-                pending.value, lambda e: isinstance(e, (StructAccess, ArrayAccess))
-            ):
-                continue
-            expr = pending.value
-            while isinstance(expr, Cast):
-                expr = expr.expr
-            if not isinstance(expr, EvalOnceExpr):
-                expr = self._eval_once(
-                    pending.value,
-                    emit_exactly_once=False,
-                    transparent=should_wrap_transparently(pending.value),
-                    reg=Register.fictive("call_arg", str(loc)),
-                    source=self.regs.current_instr_ref(),
-                )
-                pending.value = expr
-            pending.force = True
+        self._force_pending_args(lambda e: isinstance(e, (StructAccess, ArrayAccess)))
 
     def set_subroutine_arg(self, loc: int, value: Expression) -> None:
         self.subroutine_args[loc] = PendingArg(value)

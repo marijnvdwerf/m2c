@@ -31,6 +31,25 @@ from m2c.flow_graph import SwitchNode, build_flowgraph
 from m2c.types import Type
 
 
+def _build_body(lines: str, arch: X86Arch) -> Tuple[List[BodyPart], Set[str]]:
+    from m2c.asm_file import Label
+
+    asm_state = AsmState(reg_formatter=RegFormatter())
+    body: List[BodyPart] = []
+    labels: Set[str] = set()
+    for raw in lines.strip().splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.endswith(":"):
+            body.append(Label([line[:-1]]))
+            labels.add(line[:-1])
+            continue
+        asm = parse_asm_instruction(line, arch, asm_state)
+        body.append(arch.parse(asm.mnemonic, asm.args, InstructionMeta.missing()))
+    return body, labels
+
+
 class TestX86Parsing(unittest.TestCase):
     """Parse-level tests for the x86 arch: mnemonic normalization (width
     suffixes, sub-register rewriting) and structural instruction information
@@ -744,7 +763,9 @@ class TestX86FunctionAbi(unittest.TestCase):
         from m2c.arch_x86 import callee_cleanup_bytes
         from m2c.asm_instruction import AsmGlobalSymbol
 
-        self.assertEqual(callee_cleanup_bytes(AsmGlobalSymbol("__imp__f_12"), {}), 12)
+        self.assertEqual(
+            callee_cleanup_bytes(AsmGlobalSymbol("__imp__f_12"), {}, {}), 12
+        )
         self.assertEqual(
             self.abi_offsets([(Type.s32(), "i"), (Type.f64(), "d")]),
             [(4, "i"), (8, "d")],
@@ -798,38 +819,19 @@ class TestX86StackRewrite(unittest.TestCase):
     def setUp(self) -> None:
         self.arch = X86Arch()
 
-    def _build_body(self, lines: str) -> Tuple[List[BodyPart], Set[str]]:
-        from m2c.asm_file import Label
-
-        asm_state = AsmState(reg_formatter=RegFormatter())
-        body: List[BodyPart] = []
-        labels: Set[str] = set()
-        for raw in lines.strip().splitlines():
-            line = raw.strip()
-            if not line:
-                continue
-            if line.endswith(":"):
-                body.append(Label([line[:-1]]))
-                labels.add(line[:-1])
-                continue
-            asm = parse_asm_instruction(line, self.arch, asm_state)
-            body.append(
-                self.arch.parse(asm.mnemonic, asm.args, InstructionMeta.missing())
-            )
-        return body, labels
-
     def rewrite(
         self, lines: str, *, infer_direct_stdcall: bool = False
     ) -> List[Instruction]:
-        from m2c.arch_x86 import rewrite_stack_ops
+        from m2c.arch_x86 import X86ContextFacts, rewrite_stack_ops
         from m2c.asm_file import AsmData
 
-        body, labels = self._build_body(lines)
+        body, labels = _build_body(lines, self.arch)
         out = rewrite_stack_ops(
             body,
             self.arch,
             AsmData(),
             labels,
+            X86ContextFacts({}, {}),
             infer_direct_stdcall=infer_direct_stdcall,
         )
         return [p for p in out if isinstance(p, Instruction)]
@@ -942,26 +944,6 @@ class TestX86FpuRewrite(unittest.TestCase):
     def setUp(self) -> None:
         self.arch = X86Arch()
 
-    def _build_body(self, lines: str) -> Tuple[List[BodyPart], Set[str]]:
-        from m2c.asm_file import Label
-
-        asm_state = AsmState(reg_formatter=RegFormatter())
-        body: List[BodyPart] = []
-        labels: Set[str] = set()
-        for raw in lines.strip().splitlines():
-            line = raw.strip()
-            if not line:
-                continue
-            if line.endswith(":"):
-                body.append(Label([line[:-1]]))
-                labels.add(line[:-1])
-                continue
-            asm = parse_asm_instruction(line, self.arch, asm_state)
-            body.append(
-                self.arch.parse(asm.mnemonic, asm.args, InstructionMeta.missing())
-            )
-        return body, labels
-
     def rewrite(
         self, lines: str, call_deltas: Optional[Dict[str, int]] = None
     ) -> List[str]:
@@ -970,7 +952,7 @@ class TestX86FpuRewrite(unittest.TestCase):
         from m2c.asm_file import AsmData
         from m2c.x86_fpu import rewrite_fpu_ops
 
-        body, labels = self._build_body(lines)
+        body, labels = _build_body(lines, self.arch)
         out = rewrite_fpu_ops(body, self.arch, AsmData(), call_deltas or {})
         return [str(p) for p in out if isinstance(p, Instruction)]
 
@@ -981,7 +963,7 @@ class TestX86FpuRewrite(unittest.TestCase):
         from m2c.c_types import build_typemap
         from m2c.x86_fpu import rewrite_fpu_stack
 
-        body, labels = self._build_body(lines)
+        body, labels = _build_body(lines, self.arch)
         if context:
             context_path = (
                 Path(__file__).parents[2]
@@ -1024,7 +1006,7 @@ class TestX86FpuRewrite(unittest.TestCase):
             RET
             """
         )
-        self.assertEqual(out[2], "fpop $f1")
+        self.assertEqual(out[2], "fpop.fictive $f1")
         self.assertEqual(out[3], "fstp [_g], $f0")
 
     def test_fxch_swaps_slots(self) -> None:
@@ -1053,7 +1035,7 @@ class TestX86FpuRewrite(unittest.TestCase):
             """
         )
         # fld st(0) duplicates f0 into the new top f1.
-        self.assertEqual(out[1], "fmov $f1, $f0")
+        self.assertEqual(out[1], "fmov.fictive $f1, $f0")
 
     def test_merge_equal_depths(self) -> None:
         # Both branches reach L at depth 1: consistent.
@@ -1200,11 +1182,12 @@ class TestX86FpuRewrite(unittest.TestCase):
         from m2c.asm_instruction import AsmGlobalSymbol
         from m2c.x86_fpu import rewrite_fpu_ops
 
-        body, labels = self._build_body(
+        body, labels = _build_body(
             """
             FLD qword ptr [ESP + 0x4]
             FLD qword ptr [ESP + 0xc]
-            """
+            """,
+            self.arch,
         )
         body.append(
             self.arch.parse(
@@ -1229,7 +1212,7 @@ class TestX86FpuRewrite(unittest.TestCase):
         from m2c.asm_instruction import AsmGlobalSymbol
         from m2c.x86_fpu import rewrite_fpu_ops
 
-        body, labels = self._build_body("FLD qword ptr [ESP + 0x4]")
+        body, labels = _build_body("FLD qword ptr [ESP + 0x4]", self.arch)
         body.append(
             self.arch.parse(
                 "call",
@@ -1289,11 +1272,12 @@ class TestX86FpuRewrite(unittest.TestCase):
         from m2c.asm_file import AsmData
         from m2c.x86_fpu import rewrite_fpu_stack
 
-        body, labels = self._build_body(
+        body, labels = _build_body(
             """
             CALL _plain, 0x0, 0x0
             RET
-            """
+            """,
+            self.arch,
         )
         out = rewrite_fpu_stack(body, self.arch, AsmData(), {})
         self.assertIs(out, body)
@@ -1339,7 +1323,7 @@ class TestX86FpuRewrite(unittest.TestCase):
             """
         )
         self.assertEqual(out[1], "storearg.fictive 0x0, $f0")
-        self.assertEqual(out[2], "fpop $f0")
+        self.assertEqual(out[2], "fpop.fictive $f0")
 
     def test_transcendental_pop(self) -> None:
         # fpatan consumes st0 (depth 2 -> 1); operands are passed as (st0, st1).

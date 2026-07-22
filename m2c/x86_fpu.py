@@ -396,11 +396,8 @@ def rewrite_fpu_ops(
     body: List[BodyPart],
     arch: ArchAsm,
     asm_data: AsmData,
-    call_deltas: Optional[Dict[str, int]] = None,
+    call_deltas: Dict[str, int],
 ) -> List[BodyPart]:
-    call_deltas = call_deltas or {}
-    resolved_call_deltas: Dict[str, int] = call_deltas
-
     label_pos: Dict[str, int] = {}
     for i, part in enumerate(body):
         if not isinstance(part, Instruction):
@@ -465,7 +462,7 @@ def rewrite_fpu_ops(
                 )
             return 1 - helper[1]  # 2-arg -> -1, 1-arg -> 0
         key = _call_key(body, index)
-        return resolved_call_deltas.get(key, 0) if key is not None else 0
+        return call_deltas.get(key, 0) if key is not None else 0
 
     def depth_delta(index: int, item: Instruction, base: str) -> int:
         if base in FPU_UNSUPPORTED:
@@ -665,7 +662,11 @@ def rewrite_fpu_ops(
             # `fld m` (load) or `fld st(i)` (duplicate).
             st_i = _st_index(args[0])
             if st_i is not None:
-                emit("fmov", [Register(f"f{current_depth}"), flat(st_i)], meta)
+                emit(
+                    "fmov.fictive",
+                    [Register(f"f{current_depth}"), flat(st_i)],
+                    meta,
+                )
             else:
                 emit(mnemonic, [Register(f"f{current_depth}"), args[0]], meta)
         elif base == "fild":
@@ -674,22 +675,22 @@ def rewrite_fpu_ops(
             emit(base, [Register(f"f{current_depth}")], meta)
 
         # --- Stores from the top of stack. ---
-        elif base in ("fst", "fstp", "fistp"):
+        elif base in ("fst", "fstp", "fist", "fistp"):
             st_i = _st_index(args[0])
             arg_offset = call_arg_window_offset(i, args[0])
             if base in ("fst", "fstp") and arg_offset is not None:
                 src = flat(0)
                 emit("storearg.fictive", [AsmLiteral(arg_offset), src], meta)
                 if base == "fstp":
-                    emit("fpop", [src], meta)
+                    emit("fpop.fictive", [src], meta)
             elif st_i is not None:
                 # Register store form (`fst st(i)` / `fstp st(i)`).
                 if base == "fstp" and st_i == 0:
-                    emit("fpop", [flat(0)], meta)  # discard-pop idiom
+                    emit("fpop.fictive", [flat(0)], meta)  # discard-pop idiom
                 elif base == "fstp":
-                    emit("fmovpop", [flat(st_i), flat(0)], meta)
+                    emit("fmovpop.fictive", [flat(st_i), flat(0)], meta)
                 else:
-                    emit("fmov", [flat(st_i), flat(0)], meta)
+                    emit("fmov.fictive", [flat(st_i), flat(0)], meta)
             else:
                 emit(mnemonic, [args[0], flat(0)], meta)
 

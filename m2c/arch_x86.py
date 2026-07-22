@@ -539,16 +539,14 @@ def is_register_indirect_call(target: Argument) -> bool:
 
 def callee_cleanup_bytes(
     target: Argument,
-    context_arg_bytes: Optional[Dict[str, int]] = None,
-    file_arg_bytes: Optional[Dict[str, int]] = None,
+    context_arg_bytes: Dict[str, int],
+    file_arg_bytes: Dict[str, int],
 ) -> Optional[int]:
     """Number of stack bytes a call target is known to pop itself: 0 for a
     known-cdecl callee, None when the convention cannot be determined from the
     name. The sources, in strict precedence order, are marked 0-2 below;
     structural inference (compute_call_cleanup) runs only when this returns
     None, validated by the esp-balance check at return."""
-    context_arg_bytes = context_arg_bytes or {}
-    file_arg_bytes = file_arg_bytes or {}
     sym = call_target_symbol(target)
     if sym is None:
         return None
@@ -881,7 +879,7 @@ def rewrite_stack_ops(
     arch: ArchAsm,
     asm_data: AsmData,
     labels: Set[str],
-    context_facts: Optional[X86ContextFacts] = None,
+    context_facts: X86ContextFacts,
     *,
     infer_direct_stdcall: bool = False,
 ) -> List[BodyPart]:
@@ -960,9 +958,7 @@ def rewrite_stack_ops(
     # Callee cleanup information beyond inline name decoration, kept in
     # precedence tiers (see callee_cleanup_bytes): user-context stdcall
     # prototypes (highest), then file-level `.set sym, "name@N"` metadata.
-    context_arg_bytes = (
-        dict(context_facts.stdcall_arg_bytes) if context_facts is not None else {}
-    )
+    context_arg_bytes = dict(context_facts.stdcall_arg_bytes)
     file_arg_bytes: Dict[str, int] = dict(asm_data.stdcall_arg_bytes)
 
     call_cleanup: Dict[int, int] = {}
@@ -2081,12 +2077,15 @@ class X86FcmpPattern(AsmPattern):
             AsmInstruction(compare, [FCMP_LHS, FCMP_RHS]),
         ]
         if base in ("fcomp", "fucomp", "ficomp"):
-            new_body.append(AsmInstruction("fpop", [top]))
+            new_body.append(AsmInstruction("fpop.fictive", [top]))
         elif base in ("fcompp", "fucompp"):
             rhs_reg = part.args[1]
             assert isinstance(rhs_reg, Register)
             new_body.extend(
-                [AsmInstruction("fpop", [top]), AsmInstruction("fpop", [rhs_reg])]
+                [
+                    AsmInstruction("fpop.fictive", [top]),
+                    AsmInstruction("fpop.fictive", [rhs_reg]),
+                ]
             )
         return Replacement(new_body, 1)
 
@@ -2510,11 +2509,12 @@ class X86Arch(Arch):
             "fldl2t",
             "fldlg2",
             "fldln2",
-            "fmov",
-            "fmovpop",
-            "fpop",
+            "fmov.fictive",
+            "fmovpop.fictive",
+            "fpop.fictive",
             "fst",
             "fstp",
+            "fist",
             "fistp",
             "fadd",
             "fsub",
@@ -2551,8 +2551,6 @@ class X86Arch(Arch):
             "ficomp",
             "capture.float.fictive",
             "capture.int.fictive",
-            "fcmp.fictive",
-            "ficmp.fictive",
             "frndint",
             "fscale",
             "f2xm1",
@@ -3597,12 +3595,12 @@ class X86Arch(Arch):
                 s.set_reg(const_dst, make_const())
 
         # --- Register moves (fld/fst st(i), fstp st(i) with i>0) ---
-        elif base in ("fmov", "fmovpop"):
+        elif base in ("fmov.fictive", "fmovpop.fictive"):
             fmove_dst, fmove_src = args
             assert isinstance(fmove_dst, Register) and isinstance(fmove_src, Register)
             inputs = [fmove_src]
             outputs = [fmove_dst]
-            pop = base == "fmovpop"
+            pop = base == "fmovpop.fictive"
             if pop:
                 clobbers = [fmove_src]
 
@@ -3612,7 +3610,7 @@ class X86Arch(Arch):
                     del s.regs[fmove_src]
 
         # --- Pop-discard (fstp st(0)) ---
-        elif base == "fpop":
+        elif base == "fpop.fictive":
             pop_reg = args[0]
             assert isinstance(pop_reg, Register)
             inputs = [pop_reg]
@@ -3776,10 +3774,10 @@ class X86Arch(Arch):
                     # A stray fnstsw with no preceding compare: surface it.
                     s.set_reg(eax, fn_op("M2C_FNSTSW", [], Type.u16()))
 
-        # --- fistp: store the top as an integer (truncating cast), then pop.
-        # The rounding mode is assumed fixed globally, so a C truncation cast
-        # matches the ambient chop mode. ---
-        elif base == "fistp":
+        # --- fist/fistp: store the top as an integer (truncating cast), and
+        # pop for fistp only. The rounding mode is assumed fixed globally, so
+        # a C truncation cast matches the ambient chop mode. ---
+        elif base in ("fist", "fistp"):
             src = args[1]
             assert isinstance(src, Register)
             add_operand_inputs(args[0])
@@ -3793,7 +3791,9 @@ class X86Arch(Arch):
             if stack_loc is not None:
                 outputs.append(stack_loc)
             is_store = True
-            clobbers = [src]
+            pop = base == "fistp"
+            if pop:
+                clobbers = [src]
             store_itype = fpu_int_type(width)
 
             def eval_fn(s: NodeState, a: InstrArgs) -> None:
@@ -3801,7 +3801,8 @@ class X86Arch(Arch):
                 store = mem_store(a, 0, casted, None, store_itype)
                 if store is not None:
                     s.store_memory(store, src)
-                del s.regs[src]
+                if pop:
+                    del s.regs[src]
 
         # --- Integer-operand arithmetic: top op (float)int_load ---
         elif base in ("fiadd", "fisub", "fisubr", "fimul", "fidiv", "fidivr"):

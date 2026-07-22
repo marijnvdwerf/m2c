@@ -289,11 +289,10 @@ def add_test_from_file(orig_file: Path, compilers: List[Tuple[str, Compiler]]) -
                         target = "ppc-mwcc-c"
                     elif compiler.name == "agbcc":
                         target = "gba"
+                    elif compiler.name == "msvc":
+                        target = "x86"
                     else:
-                        if compiler.name == "msvc":
-                            target = "x86"
-                        else:
-                            target = "sh2-gcc-c"
+                        target = "sh2-gcc-c"
                     flags_path.write_text(f"--target {target}\n")
         except Exception:
             logger.exception(f"Failed to compile {asm_file_path}")

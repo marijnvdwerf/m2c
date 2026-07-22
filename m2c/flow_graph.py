@@ -1227,7 +1227,8 @@ def compute_relations(nodes: List[Node]) -> None:
             immediately_dominates(node).clear()
         for node in nodes:
             strict_dominators = dominators(node).difference({node})
-            # If `node == entry` or the flow graph is not reducible, `doms` may be empty.
+            # If `node == entry` or the flow graph is not reducible,
+            # `strict_dominators` may be empty.
             # TODO: Infinite loops could be made reducible by introducing
             # branches like `if (false) { return; }` without breaking semantics
             if strict_dominators:
